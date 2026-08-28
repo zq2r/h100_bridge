@@ -109,8 +109,16 @@ def setup_readline(sid):
         exist_ok=True,
     )
 
+    # Normal shell-style line editing.
     readline.parse_and_bind(
         "set editing-mode emacs"
+    )
+
+    # Important:
+    # keep a pasted multi-line block in the input buffer
+    # instead of treating every pasted newline as Enter.
+    readline.parse_and_bind(
+        "set enable-bracketed-paste on"
     )
 
     readline.parse_and_bind(
@@ -123,8 +131,8 @@ def setup_readline(sid):
 
     readline.set_history_length(5000)
 
-    # 每次新的 h100-shell 进程启动，
-    # 显式从共享存储加载历史。
+    # Each h100-shell client reloads the persistent
+    # history belonging to this H100 session.
     readline.clear_history()
 
     if history_file.exists():
@@ -133,8 +141,38 @@ def setup_readline(sid):
                 "r",
                 encoding="utf-8",
             ) as f:
+
                 for line in f:
-                    command = line.rstrip("\n")
+                    line = line.rstrip("\n")
+
+                    if not line:
+                        continue
+
+                    command = None
+
+                    try:
+                        record = json.loads(line)
+
+                        # New format:
+                        # {"command": "..."}
+                        if (
+                            isinstance(record, dict)
+                            and isinstance(
+                                record.get("command"),
+                                str,
+                            )
+                        ):
+                            command = record[
+                                "command"
+                            ]
+
+                    except json.JSONDecodeError:
+                        pass
+
+                    # Backward compatibility with
+                    # the old one-command-per-line format.
+                    if command is None:
+                        command = line
 
                     if command:
                         readline.add_history(
@@ -158,14 +196,24 @@ def save_command_history(
         return
 
     try:
+        record = {
+            "command": command,
+        }
+
         with history_file.open(
             "a",
             encoding="utf-8",
         ) as f:
             f.write(
-                command + "\n"
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
+
             f.flush()
+
             os.fsync(
                 f.fileno()
             )
