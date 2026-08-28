@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
+import traceback
 
 BASE = Path(
     os.environ["H100_BRIDGE"]
@@ -57,6 +57,11 @@ def atomic_write(
     path,
     content,
 ):
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     tmp = path.parent / (
         f".{path.name}.tmp."
@@ -260,8 +265,13 @@ def launch_worker(
     root = (
         SESSIONS / sid
     )
-
+    
     root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    (root / "state").mkdir(
         parents=True,
         exist_ok=True,
     )
@@ -459,9 +469,19 @@ def main():
 
             for path in requests:
 
-                process_request(
-                    path
-                )
+                try:
+                    process_request(
+                        path
+                    )
+
+                except Exception:
+                    print(
+                        f"Failed to process request: "
+                        f"{path}",
+                        flush=True,
+                    )
+
+                    traceback.print_exc()
 
             time.sleep(0.1)
 
