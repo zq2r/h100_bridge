@@ -17,6 +17,10 @@ BASE = Path(
     os.environ["H100_BRIDGE"]
 ).expanduser().resolve()
 
+MAX_STREAM_LINES = 1000
+
+CONSUMED_GRACE_SECONDS = 2.0
+
 
 def atomic_write(path, content):
     path.parent.mkdir(
@@ -88,6 +92,10 @@ class Worker:
         self.stop_requested = False
 
         self.lock_fd = None
+        
+        self.stream_lock = (
+            threading.Lock()
+        )
 
     # =========================================
     # Local worker lock
@@ -291,14 +299,157 @@ class Worker:
                 if not data:
                     return
 
-                os.write(
-                    fd,
-                    data,
-                )
+                with self.stream_lock:
+                    os.write(
+                        fd,
+                        data,
+                    )
 
         finally:
 
             os.close(fd)
+                
+    def trim_stream(self):
+        """
+        Keep only the most recent
+        MAX_STREAM_LINES terminal lines.
+
+        Must use the same lock as output_loop
+        so stream.log cannot be modified while
+        PTY output is being appended.
+        """
+
+        with self.stream_lock:
+
+            try:
+                with self.stream.open(
+                    "rb"
+                ) as f:
+
+                    f.seek(
+                        0,
+                        os.SEEK_END,
+                    )
+
+                    pos = f.tell()
+
+                    chunks = []
+                    line_breaks = 0
+
+                    while (
+                        pos > 0
+                        and line_breaks
+                        <= MAX_STREAM_LINES
+                    ):
+                        size = min(
+                            65536,
+                            pos,
+                        )
+
+                        pos -= size
+
+                        f.seek(pos)
+
+                        chunk = f.read(
+                            size
+                        )
+
+                        chunks.append(
+                            chunk
+                        )
+
+                        # \r 也算，因为 tqdm 等
+                        # 经常用 carriage return。
+                        line_breaks += (
+                            chunk.count(b"\n")
+                            + chunk.count(b"\r")
+                        )
+
+                data = b"".join(
+                    reversed(chunks)
+                )
+
+                lines = data.splitlines(
+                    keepends=True
+                )
+
+                if (
+                    pos == 0
+                    and len(lines)
+                    <= MAX_STREAM_LINES
+                ):
+                    return
+
+                tail = b"".join(
+                    lines[
+                        -MAX_STREAM_LINES:
+                    ]
+                )
+
+                # 这里不能 os.replace 新文件！
+                #
+                # output_loop 长期持有原 stream.log
+                # 的 fd。必须原 inode 上 truncate。
+                with self.stream.open(
+                    "r+b",
+                    buffering=0,
+                ) as f:
+
+                    f.seek(0)
+
+                    f.write(
+                        tail
+                    )
+
+                    f.truncate()
+
+            except OSError:
+                pass
+            
+    def wait_for_consumed(
+        self,
+        jid,
+    ):
+        ack = (
+            self.control
+            / f"consumed.{jid}"
+        )
+
+        deadline = (
+            time.time()
+            + CONSUMED_GRACE_SECONDS
+        )
+
+        while (
+            time.time()
+            < deadline
+        ):
+
+            if ack.exists():
+
+                ack.unlink(
+                    missing_ok=True
+                )
+
+                return
+
+            if (
+                self.control
+                / "terminate"
+            ).exists():
+                return
+
+            self.update_heartbeat()
+
+            time.sleep(0.05)
+
+        # client 断了也不能永久卡 worker。
+        #
+        # 最多等两秒，然后仍然裁剪。
+        ack.unlink(
+            missing_ok=True
+        )
+
 
     def shell_alive(self):
 
@@ -526,16 +677,28 @@ class Worker:
 
             time.sleep(0.05)
 
-        try:
+        # 等 client 确认已经读到结束 marker。
+        #
+        # client 消失时最多等 2 秒，
+        # 所以不会让 worker 永久卡住。
+        self.wait_for_consumed(
+            jid
+        )
 
-            os.replace(
-                running,
-                self.done
-                / f"{jid}.cmd",
-            )
+        # command 完成后将 session 输出
+        # 压缩到最近 1000 行。
+        self.trim_stream()
 
-        except FileNotFoundError:
-            pass
+        # command 已经另外保存在
+        # client_history 中，因此不需要
+        # 永久保存 queue/done 副本。
+        running.unlink(
+            missing_ok=True
+        )
+
+        rc_file.unlink(
+            missing_ok=True
+        )
 
         self.set_state(
             "current_job",
@@ -585,6 +748,15 @@ class Worker:
         while True:
 
             self.update_heartbeat()
+            for ack in (
+                self.control.glob(
+                    "consumed.*"
+                )
+            ):
+                try:
+                    ack.unlink()
+                except OSError:
+                    pass
 
             if (
                 self.control

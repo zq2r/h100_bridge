@@ -26,7 +26,7 @@ SUPERVISOR_HEARTBEAT = (
 NAME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
 )
-
+MAX_HISTORY_COMMANDS = 100
 
 # =========================================================
 # Basic helpers
@@ -129,7 +129,7 @@ def setup_readline(sid):
         '"\\e[B": next-history'
     )
 
-    readline.set_history_length(5000)
+    readline.set_history_length(MAX_HISTORY_COMMANDS)
 
     # Each h100-shell client reloads the persistent
     # history belonging to this H100 session.
@@ -200,29 +200,66 @@ def save_command_history(
             "command": command,
         }
 
-        with history_file.open(
-            "a",
+        new_line = json.dumps(
+            record,
+            ensure_ascii=False,
+        )
+
+        old_lines = []
+
+        if history_file.exists():
+            with history_file.open(
+                "r",
+                encoding="utf-8",
+            ) as f:
+                old_lines = [
+                    line.rstrip("\n")
+                    for line in f
+                    if line.strip()
+                ]
+
+        # 保留最近 99 条 + 当前这一条
+        lines = (
+            old_lines[
+                -(MAX_HISTORY_COMMANDS - 1):
+            ]
+            + [new_line]
+        )
+
+        tmp = (
+            history_file.parent
+            / (
+                f".{history_file.name}.tmp."
+                f"{os.getpid()}."
+                f"{uuid.uuid4().hex[:8]}"
+            )
+        )
+
+        with tmp.open(
+            "w",
             encoding="utf-8",
         ) as f:
-            f.write(
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
+            for line in lines:
+                f.write(
+                    line + "\n"
                 )
-                + "\n"
-            )
 
             f.flush()
-
             os.fsync(
                 f.fileno()
             )
+
+        os.replace(
+            tmp,
+            history_file,
+        )
 
     except Exception as exc:
         print(
             f"[warning] failed to save history: {exc}",
             file=sys.stderr,
         )
+
 
 def atomic_write(path, content):
 
@@ -777,6 +814,22 @@ def interrupt(sid, jid):
         / "control"
         / f"interrupt.{jid}.{token}"
     ).touch()
+    
+def ack_job_consumed(
+    sid,
+    jid,
+):
+    root = root_of(sid)
+
+    try:
+        (
+            root
+            / "control"
+            / f"consumed.{jid}"
+        ).touch()
+
+    except OSError:
+        pass
 
 
 # =========================================================
@@ -923,14 +976,19 @@ def wait_for_job(
                 continue
 
             try:
-
-                return int(
+                rc = int(
                     rest[:end]
                 )
 
             except ValueError:
+                rc = 1
 
-                return 1
+            ack_job_consumed(
+                sid,
+                jid,
+            )
+
+            return rc
 
 
 # =========================================================
