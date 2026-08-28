@@ -1,0 +1,28 @@
+cat > .gitignore <<'EOF'
+# =========================
+# H100 bridge runtime state
+# =========================
+
+/sessions/
+/requests/
+/names/
+
+/supervisor_heartbeat
+/supervisor.pid
+/supervisor.log
+
+# Runtime files
+*.pid
+*.log
+*.sock
+*.state
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+EOF
