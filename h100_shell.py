@@ -742,11 +742,17 @@ def prompt(sid):
         if conda
         else ""
     )
+    
+    display_pwd = (
+        Path(pwd).name
+        if pwd != "/"
+        else "/"
+    )
 
     return (
         f"{env}"
         f"H100[{label}]"
-        f":{pwd}$ "
+        f":{display_pwd}$ "
     )
 
 
