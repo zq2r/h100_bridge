@@ -10,6 +10,13 @@ import time
 import uuid
 from pathlib import Path
 import readline
+import select
+import termios
+import tty
+from contextlib import contextmanager
+import select
+import termios
+import tty
 
 BASE = Path(
     os.environ["H100_BRIDGE"]
@@ -28,9 +35,157 @@ NAME_RE = re.compile(
 )
 MAX_HISTORY_COMMANDS = 100
 
+class DetachRequested(Exception):
+    pass
+
 # =========================================================
 # Basic helpers
 # =========================================================
+# =========================================================
+# Path completion
+# =========================================================
+
+def path_completion_matches(
+    sid,
+    text,
+):
+    """
+    Complete paths using the filesystem visible
+    to the h100-shell client.
+
+    Relative paths are resolved against the real
+    H100 working directory stored in state/pwd.
+    """
+
+    root = root_of(sid)
+
+    pwd = read_text(
+        root / "state" / "pwd",
+        "",
+    )
+
+    if not pwd:
+        return []
+
+    # ~ expansion is intentionally not handled here.
+    # The client machine's home may differ from H100.
+    if text.startswith("~"):
+        return []
+
+    parent_text, prefix = os.path.split(
+        text
+    )
+
+    if os.path.isabs(text):
+
+        base = Path(
+            parent_text or "/"
+        )
+
+    else:
+
+        base = Path(pwd)
+
+        if parent_text:
+            base = (
+                base / parent_text
+            )
+
+    try:
+        entries = list(
+            base.iterdir()
+        )
+
+    except (
+        OSError,
+        PermissionError,
+    ):
+        return []
+
+    # Preserve the part already typed.
+    #
+    # foo/ba
+    # -> display_parent = foo/
+    #
+    # /abc/ba
+    # -> display_parent = /abc/
+    if prefix:
+        display_parent = (
+            text[:-len(prefix)]
+        )
+    else:
+        display_parent = text
+
+    matches = []
+
+    for entry in entries:
+
+        name = entry.name
+
+        # Like normal bash:
+        # don't show hidden files unless
+        # user already typed ".".
+        if (
+            name.startswith(".")
+            and not prefix.startswith(".")
+        ):
+            continue
+
+        if not name.startswith(prefix):
+            continue
+
+        candidate = (
+            display_parent + name
+        )
+
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            is_dir = False
+
+        if is_dir:
+            candidate += "/"
+        else:
+            candidate += " "
+
+        matches.append(
+            candidate
+        )
+
+    return sorted(matches)
+
+
+def make_path_completer(sid):
+
+    cached_text = None
+    cached_matches = []
+
+    def completer(text, state):
+
+        nonlocal cached_text
+        nonlocal cached_matches
+
+        if (
+            state == 0
+            or text != cached_text
+        ):
+            cached_text = text
+
+            cached_matches = (
+                path_completion_matches(
+                    sid,
+                    text,
+                )
+            )
+
+        if state < len(
+            cached_matches
+        ):
+            return cached_matches[state]
+
+        return None
+
+    return completer
 
 def delete_session(ref):
 
@@ -119,6 +274,22 @@ def setup_readline(sid):
     # instead of treating every pasted newline as Enter.
     readline.parse_and_bind(
         "set enable-bracketed-paste on"
+    )
+    
+    # Path completion.
+    #
+    # Keep "/" inside the readline word so
+    # "foo/bar<Tab>" is passed as a whole path.
+    readline.set_completer_delims(
+        " \t\n;|&()<>="
+    )
+
+    readline.set_completer(
+        make_path_completer(sid)
+    )
+
+    readline.parse_and_bind(
+        "tab: complete"
     )
 
     readline.parse_and_bind(
@@ -867,54 +1038,58 @@ def wait_for_job(
     )
 
     buffer = b""
+    stdin_fd = None
+    old_termios = None
 
-    with stream.open(
-        "rb",
-        buffering=0,
-    ) as f:
+    if sys.stdin.isatty():
+        stdin_fd = sys.stdin.fileno()
 
-        f.seek(offset)
+        old_termios = termios.tcgetattr(
+            stdin_fd
+        )
 
-        while True:
+        # 让 Ctrl+D 能被逐键读取。
+        # Ctrl+C 的 signal 行为仍然保留。
+        tty.setcbreak(
+            stdin_fd
+        )
+    try:
+        with stream.open(
+            "rb",
+            buffering=0,
+        ) as f:
 
-            try:
+            f.seek(offset)
 
-                data = f.read(
-                    65536
-                )
-
-            except KeyboardInterrupt:
-
-                interrupt(
-                    sid,
-                    jid,
-                )
-
-                sys.stdout.write(
-                    "^C\n"
-                )
-
-                sys.stdout.flush()
-
-                continue
-
-            if not data:
-
-                if not worker_alive(
-                    sid
-                ):
-
-                    print(
-                        "\n[H100 worker "
-                        "is no longer alive]"
-                    )
-
-                    return 1
+            while True:
 
                 try:
 
-                    time.sleep(
-                        0.03
+                    # Ctrl+D = detach client
+                    if stdin_fd is not None:
+
+                        readable, _, _ = (
+                            select.select(
+                                [stdin_fd],
+                                [],
+                                [],
+                                0,
+                            )
+                        )
+
+                        if readable:
+
+                            key = os.read(
+                                stdin_fd,
+                                1,
+                            )
+
+                            # Ctrl+D = 0x04
+                            if key == b"\x04":
+                                raise DetachRequested()
+
+                    data = f.read(
+                        65536
                     )
 
                 except KeyboardInterrupt:
@@ -930,72 +1105,130 @@ def wait_for_job(
 
                     sys.stdout.flush()
 
-                continue
+                    continue
 
-            buffer += data
+                except KeyboardInterrupt:
 
-            pos = buffer.find(
-                marker
-            )
-
-            if pos < 0:
-
-                if len(buffer) > keep:
-
-                    cut = (
-                        len(buffer)
-                        - keep
+                    interrupt(
+                        sid,
+                        jid,
                     )
+
+                    sys.stdout.write(
+                        "^C\n"
+                    )
+
+                    sys.stdout.flush()
+
+                    continue
+
+                if not data:
+
+                    if not worker_alive(
+                        sid
+                    ):
+
+                        print(
+                            "\n[H100 worker "
+                            "is no longer alive]"
+                        )
+
+                        return 1
+
+                    try:
+
+                        time.sleep(
+                            0.03
+                        )
+
+                    except KeyboardInterrupt:
+
+                        interrupt(
+                            sid,
+                            jid,
+                        )
+
+                        sys.stdout.write(
+                            "^C\n"
+                        )
+
+                        sys.stdout.flush()
+
+                    continue
+
+                buffer += data
+
+                pos = buffer.find(
+                    marker
+                )
+
+                if pos < 0:
+
+                    if len(buffer) > keep:
+
+                        cut = (
+                            len(buffer)
+                            - keep
+                        )
+
+                        os.write(
+                            sys.stdout.fileno(),
+                            buffer[:cut],
+                        )
+
+                        buffer = (
+                            buffer[cut:]
+                        )
+
+                    continue
+
+                if pos > 0:
 
                     os.write(
                         sys.stdout.fileno(),
-                        buffer[:cut],
+                        buffer[:pos],
                     )
+
+                rest = buffer[
+                    pos + len(marker):
+                ]
+
+                end = rest.find(
+                    end_marker
+                )
+
+                if end < 0:
 
                     buffer = (
-                        buffer[cut:]
+                        buffer[pos:]
                     )
 
-                continue
+                    continue
 
-            if pos > 0:
+                try:
+                    rc = int(
+                        rest[:end]
+                    )
 
-                os.write(
-                    sys.stdout.fileno(),
-                    buffer[:pos],
+                except ValueError:
+                    rc = 1
+
+                ack_job_consumed(
+                    sid,
+                    jid,
                 )
 
-            rest = buffer[
-                pos + len(marker):
-            ]
-
-            end = rest.find(
-                end_marker
+                return rc
+    finally:
+        if (
+            stdin_fd is not None
+            and old_termios is not None
+        ):
+            termios.tcsetattr(
+                stdin_fd,
+                termios.TCSADRAIN,
+                old_termios,
             )
-
-            if end < 0:
-
-                buffer = (
-                    buffer[pos:]
-                )
-
-                continue
-
-            try:
-                rc = int(
-                    rest[:end]
-                )
-
-            except ValueError:
-                rc = 1
-
-            ack_job_consumed(
-                sid,
-                jid,
-            )
-
-            return rc
-
 
 # =========================================================
 # List
@@ -1401,11 +1634,32 @@ def run_shell(sid):
             "running command]"
         )
 
-        rc = wait_for_job(
-            sid,
-            current_job,
-            int(current_offset),
-        )
+        try:
+
+            rc = wait_for_job(
+                sid,
+                current_job,
+                int(current_offset),
+            )
+
+        except DetachRequested:
+
+            print()
+            print(
+                f"Detached from "
+                f"{name or sid}"
+            )
+
+            print(
+                "Reattach with:"
+            )
+
+            print(
+                f"  h100-shell --attach "
+                f"{name or sid}"
+            )
+
+            return
 
         if rc != 0:
 
@@ -1474,11 +1728,32 @@ def run_shell(sid):
             command,
         )
 
-        rc = wait_for_job(
-            sid,
-            jid,
-            offset,
-        )
+        try:
+
+            rc = wait_for_job(
+                sid,
+                jid,
+                offset,
+            )
+
+        except DetachRequested:
+
+            print()
+            print(
+                f"Detached from "
+                f"{name or sid}"
+            )
+
+            print(
+                "Reattach with:"
+            )
+
+            print(
+                f"  h100-shell --attach "
+                f"{name or sid}"
+            )
+
+            return
 
         if rc != 0:
 
