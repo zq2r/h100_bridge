@@ -14,9 +14,12 @@ import select
 import termios
 import tty
 from contextlib import contextmanager
-import select
-import termios
-import tty
+
+DEFAULT_START_DIR = (
+    "/inspire/hdd/global_user/"
+    "zhouzhixiang-240107010008/qzj/"
+    "project/Beta-Binomial-PRM"
+)
 
 BASE = Path(
     os.environ["H100_BRIDGE"]
@@ -35,12 +38,62 @@ NAME_RE = re.compile(
 )
 MAX_HISTORY_COMMANDS = 100
 
+MAX_REPLAY_LINES = 1000
+
+ALT_SCREEN_ENTER = (
+    b"\x1b[?1049h"
+    b"\x1b[2J"
+    b"\x1b[H"
+)
+
+ALT_SCREEN_EXIT = (
+    b"\x1b[?1049l"
+)
+
+DONE_MARKER_RE = re.compile(
+    rb"\x1eH100_DONE:"
+    rb"([^:\x1f]+):"
+    rb"(-?\d+)"
+    rb"\x1f"
+    rb"(?:\r?\n)?"
+)
+
 class DetachRequested(Exception):
     pass
+
 
 # =========================================================
 # Basic helpers
 # =========================================================
+
+@contextmanager
+def alternate_screen():
+
+    if not sys.stdout.isatty():
+        yield
+        return
+
+    fd = sys.stdout.fileno()
+
+    sys.stdout.flush()
+
+    os.write(
+        fd,
+        ALT_SCREEN_ENTER,
+    )
+
+    try:
+        yield
+
+    finally:
+
+        sys.stdout.flush()
+
+        os.write(
+            fd,
+            ALT_SCREEN_EXIT,
+        )
+        
 # =========================================================
 # Path completion
 # =========================================================
@@ -1008,7 +1061,155 @@ def ack_job_consumed(
     except OSError:
         pass
 
+def read_stream_tail(
+    stream,
+    max_lines=MAX_REPLAY_LINES,
+):
 
+    if not stream.exists():
+        return b"", 0
+
+    try:
+
+        with stream.open(
+            "rb"
+        ) as f:
+
+            f.seek(
+                0,
+                os.SEEK_END,
+            )
+
+            end_offset = f.tell()
+            pos = end_offset
+
+            chunks = []
+            line_breaks = 0
+
+            while (
+                pos > 0
+                and line_breaks
+                <= max_lines
+            ):
+
+                size = min(
+                    65536,
+                    pos,
+                )
+
+                pos -= size
+
+                f.seek(pos)
+
+                chunk = f.read(
+                    size
+                )
+
+                chunks.append(
+                    chunk
+                )
+
+                # tqdm 等经常用 \r
+                line_breaks += (
+                    chunk.count(b"\n")
+                    + chunk.count(b"\r")
+                )
+
+        data = b"".join(
+            reversed(chunks)
+        )
+
+        lines = data.splitlines(
+            keepends=True
+        )
+
+        # 如果从文件中间开始读，
+        # 第一行可能是不完整的。
+        if pos > 0 and lines:
+            lines = lines[1:]
+
+        data = b"".join(
+            lines[-max_lines:]
+        )
+
+        return (
+            data,
+            end_offset,
+        )
+
+    except OSError:
+
+        return b"", 0
+
+
+def replay_stream(sid):
+
+    stream = (
+        root_of(sid)
+        / "stream.log"
+    )
+
+    data, end_offset = (
+        read_stream_tail(
+            stream
+        )
+    )
+
+    completed_jobs = {}
+
+    for match in (
+        DONE_MARKER_RE.finditer(
+            data
+        )
+    ):
+
+        try:
+
+            jid = (
+                match.group(1)
+                .decode(
+                    errors="replace"
+                )
+            )
+
+            rc = int(
+                match.group(2)
+            )
+
+            completed_jobs[
+                jid
+            ] = rc
+
+        except Exception:
+            pass
+
+    # 去掉内部 H100_DONE marker
+    data = DONE_MARKER_RE.sub(
+        b"",
+        data,
+    )
+
+    if data:
+
+        os.write(
+            sys.stdout.fileno(),
+            data,
+        )
+
+        # 防止最后一行输出没有换行，
+        # 导致新 prompt 黏在后面。
+        if not data.endswith(
+            (b"\n", b"\r")
+        ):
+            os.write(
+                sys.stdout.fileno(),
+                b"\n",
+            )
+
+    return (
+        end_offset,
+        completed_jobs,
+    )
 # =========================================================
 # Wait / output
 # =========================================================
@@ -1059,7 +1260,17 @@ def wait_for_job(
             buffering=0,
         ) as f:
 
-            f.seek(offset)
+            size = os.fstat(
+                f.fileno()
+            ).st_size
+
+            # stream.log 可能已经被 worker trim。
+            if offset > size:
+                offset = 0
+
+            f.seek(
+                offset
+            )
 
             while True:
 
@@ -1091,21 +1302,6 @@ def wait_for_job(
                     data = f.read(
                         65536
                     )
-
-                except KeyboardInterrupt:
-
-                    interrupt(
-                        sid,
-                        jid,
-                    )
-
-                    sys.stdout.write(
-                        "^C\n"
-                    )
-
-                    sys.stdout.flush()
-
-                    continue
 
                 except KeyboardInterrupt:
 
@@ -1569,8 +1765,22 @@ def prune_dead():
 # =========================================================
 # Attach
 # =========================================================
-
 def run_shell(sid):
+    
+    name = session_name(sid)
+
+    with alternate_screen():
+
+        _run_shell(
+            sid
+        )
+
+    print(
+        f"Detached from "
+        f"{name or sid}"
+    )
+        
+def _run_shell(sid):
 
     root = root_of(sid)
     
@@ -1602,6 +1812,13 @@ def run_shell(sid):
         "Ctrl-D or 'exit' detaches; "
         "the H100 shell stays alive."
     )
+    print()
+
+    replay_offset, completed_jobs = (
+        replay_stream(
+            sid
+        )
+    )
 
     # -----------------------------------------------------
     # Existing foreground job
@@ -1616,50 +1833,46 @@ def run_shell(sid):
         "",
     )
 
-    current_offset = read_text(
-        root
-        / "state"
-        / "current_job_offset",
-        "",
-    )
-
     if (
         status == "running"
         and current_job
-        and current_offset
     ):
 
-        print(
-            "[reattaching to "
-            "running command]"
-        )
+        # 有一种很小的 race：
+        #
+        # DONE marker 已经写入 stream，
+        # 但 worker 还没来得及把 status
+        # 从 running 改成 idle。
+        if current_job in completed_jobs:
 
-        try:
+            rc = completed_jobs[
+                current_job
+            ]
 
-            rc = wait_for_job(
+            ack_job_consumed(
                 sid,
                 current_job,
-                int(current_offset),
             )
 
-        except DetachRequested:
+        else:
 
-            print()
-            print(
-                f"Detached from "
-                f"{name or sid}"
-            )
+            try:
 
-            print(
-                "Reattach with:"
-            )
+                # 注意：
+                # 这里不再从 current_job_offset
+                # 开始读。
+                #
+                # 前面的历史输出已经 replay 过，
+                # 所以从刚才 stream.log 的 EOF
+                # 继续实时读。
+                rc = wait_for_job(
+                    sid,
+                    current_job,
+                    replay_offset,
+                )
 
-            print(
-                f"  h100-shell --attach "
-                f"{name or sid}"
-            )
-
-            return
+            except DetachRequested:
+                return
 
         if rc != 0:
 
@@ -1738,21 +1951,6 @@ def run_shell(sid):
 
         except DetachRequested:
 
-            print()
-            print(
-                f"Detached from "
-                f"{name or sid}"
-            )
-
-            print(
-                "Reattach with:"
-            )
-
-            print(
-                f"  h100-shell --attach "
-                f"{name or sid}"
-            )
-
             return
 
         if rc != 0:
@@ -1760,22 +1958,6 @@ def run_shell(sid):
             print(
                 f"[exit {rc}]"
             )
-
-    name = session_name(sid)
-
-    print(
-        f"Detached from "
-        f"{name or sid}"
-    )
-
-    print(
-        "Reattach with:"
-    )
-
-    print(
-        f"  h100-shell --attach "
-        f"{name or sid}"
-    )
 
 
 # =========================================================
@@ -1918,8 +2100,13 @@ def main():
 
         else:
 
+            start_dir = (
+                args.start_dir
+                or DEFAULT_START_DIR
+            )
+
             sid = create_session(
-                args.start_dir,
+                start_dir,
                 args.name,
             )
 
