@@ -15,6 +15,10 @@ import termios
 import tty
 from contextlib import contextmanager
 
+from h100_ui import (
+    run_h100_ui,
+)
+
 DEFAULT_START_DIR = (
     "/inspire/hdd/global_user/"
     "zhouzhixiang-240107010008/qzj/"
@@ -411,6 +415,75 @@ def setup_readline(sid):
 
     return history_file
 
+def load_command_history(
+    history_file,
+):
+
+    result = []
+
+    if not history_file.exists():
+        return result
+
+    try:
+
+        with history_file.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            for line in f:
+
+                line = line.rstrip(
+                    "\n"
+                )
+
+                if not line:
+                    continue
+
+                command = None
+
+                try:
+
+                    record = json.loads(
+                        line
+                    )
+
+                    if (
+                        isinstance(
+                            record,
+                            dict,
+                        )
+                        and isinstance(
+                            record.get(
+                                "command"
+                            ),
+                            str,
+                        )
+                    ):
+                        command = (
+                            record[
+                                "command"
+                            ]
+                        )
+
+                except json.JSONDecodeError:
+                    pass
+
+                # Old plain-text history format.
+                if command is None:
+                    command = line
+
+                if command:
+                    result.append(
+                        command
+                    )
+
+    except OSError:
+        pass
+
+    return result[
+        -MAX_HISTORY_COMMANDS:
+    ]
 
 def save_command_history(
     history_file,
@@ -1766,14 +1839,120 @@ def prune_dead():
 # Attach
 # =========================================================
 def run_shell(sid):
-    
+
+    root = root_of(sid)
+
+    if not root.exists():
+
+        raise RuntimeError(
+            f"Session does not exist: "
+            f"{sid}"
+        )
+
+    if not worker_alive(sid):
+
+        raise RuntimeError(
+            f"H100 worker for session "
+            f"{sid} is not alive."
+        )
+
     name = session_name(sid)
 
-    with alternate_screen():
+    label = (
+        name
+        if name
+        else sid[:6]
+    )
 
-        _run_shell(
-            sid
+    history_file = (
+        root
+        / "state"
+        / "client_history"
+    )
+
+    history_items = (
+        load_command_history(
+            history_file
         )
+    )
+
+    def current_job():
+
+        if status_of(sid) != "running":
+            return ""
+
+        return read_text(
+            root
+            / "state"
+            / "current_job",
+            "",
+        )
+
+    run_h100_ui(
+
+        sid=sid,
+
+        label=label,
+
+        stream_path=(
+            root / "stream.log"
+        ),
+
+        prompt_func=lambda: (
+            prompt(sid)
+        ),
+
+        submit_func=lambda command: (
+            submit(
+                sid,
+                command,
+            )
+        ),
+
+        interrupt_func=lambda jid: (
+            interrupt(
+                sid,
+                jid,
+            )
+        ),
+
+        ack_func=lambda jid: (
+            ack_job_consumed(
+                sid,
+                jid,
+            )
+        ),
+
+        worker_alive_func=lambda: (
+            worker_alive(
+                sid
+            )
+        ),
+
+        current_job_func=(
+            current_job
+        ),
+
+        save_history_func=lambda command: (
+            save_command_history(
+                history_file,
+                command,
+            )
+        ),
+
+        history_items=history_items,
+
+        completion_func=lambda text: (
+            path_completion_matches(
+                sid,
+                text,
+            )
+        ),
+
+        max_output_lines=(
+            MAX_REPLAY_LINES
+        ),
+    )
 
     print(
         f"Detached from "
