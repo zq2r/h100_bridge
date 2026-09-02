@@ -235,6 +235,10 @@ class H100UI:
 
         self.follow_output = True
 
+        # Ctrl+G 等显式操作要求下一次 render
+        # 强制回到底部。不能只依赖旧 render_info。
+        self.force_bottom = False
+
         # -------------------------------------------------
         # History
         # -------------------------------------------------
@@ -414,7 +418,7 @@ class H100UI:
             f" | {follow}"
             f" | Ctrl-D detach"
             f" | Ctrl-C interrupt"
-            f" | Ctrl-G bottom"
+            f" | Alt-G bottom"
             f"{extra} "
         )
 
@@ -440,14 +444,17 @@ class H100UI:
             errors="replace",
         )
 
-        # First version:
-        # turn carriage-return progress updates
-        # into separate visible lines.
-        text = text.replace(
-            "\r\n",
+        # PTY / interactive bash may emit sequences like
+        # "\r\r\n". Treat any CR run followed by LF
+        # as a single logical newline.
+        text = re.sub(
+            r"\r+\n",
             "\n",
+            text,
         )
 
+        # Lone CR is typically used by tqdm/progress bars.
+        # Current TUI renders those as separate lines.
         text = text.replace(
             "\r",
             "\n",
@@ -621,20 +628,26 @@ class H100UI:
             .render_info
         )
 
-        follow = (
-            self.follow_output
-        )
-
+        follow = self.follow_output
         anchor_row = 0
 
         if render_info is not None:
 
-            follow = (
-                render_info
-                .bottom_visible
-            )
+            # Ctrl+G 刚刚被按下时，
+            # 不允许旧 render_info 把 FOLLOW
+            # 又覆盖成 SCROLL。
+            if self.force_bottom:
+
+                follow = True
+
+            else:
+
+                follow = (
+                    render_info.bottom_visible
+                )
 
             if not follow:
+
                 anchor_row = (
                     render_info
                     .first_visible_line()
@@ -679,15 +692,36 @@ class H100UI:
     def _jump_to_bottom(self):
 
         self.follow_output = True
+        self.force_bottom = True
 
-        text = (
-            self.output_area.text
+        text = self.output_area.text
+
+        # 1. Buffer cursor 放到最后。
+        self.output_area.buffer.cursor_position = (
+            len(text)
         )
 
-        self._set_output(
-            text,
-            follow=True,
+        # 2. 更重要：
+        # Window 本身的 viewport 直接移到底部。
+        info = (
+            self.output_area
+            .window
+            .render_info
         )
+
+        if info is not None:
+
+            max_scroll = max(
+                0,
+                info.content_height
+                - info.window_height,
+            )
+
+            self.output_area.window.vertical_scroll = (
+                max_scroll
+            )
+
+            self.output_area.window.vertical_scroll_2 = 0
 
     # =====================================================
     # Initial stream
@@ -846,6 +880,43 @@ class H100UI:
         self._poll_stream()
 
         self._sync_job_state()
+
+        info = (
+            self.output_area
+            .window
+            .render_info
+        )
+
+        if self.force_bottom:
+
+            # 每次 render 前再保险一次。
+            self.output_area.buffer.cursor_position = (
+                len(
+                    self.output_area.text
+                )
+            )
+
+            if info is not None:
+
+                self.output_area.window.vertical_scroll = max(
+                    0,
+                    info.content_height
+                    - info.window_height,
+                )
+
+                self.output_area.window.vertical_scroll_2 = 0
+
+                # 上一次 render 已经成功到底，
+                # 可以退出强制模式。
+                if info.bottom_visible:
+                    self.force_bottom = False
+
+        elif info is not None:
+
+            # 鼠标滚动也会反映到状态栏。
+            self.follow_output = (
+                info.bottom_visible
+            )
 
     # =====================================================
     # Command handling
@@ -1044,7 +1115,11 @@ class H100UI:
 
             event.app.invalidate()
 
-        @self.kb.add("c-g")
+        @self.kb.add(
+            "escape",
+            "g",
+            eager=True,
+        )
         def _bottom(event):
 
             self._jump_to_bottom()

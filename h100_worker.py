@@ -21,6 +21,20 @@ MAX_STREAM_LINES = 1000
 
 CONSUMED_GRACE_SECONDS = 2.0
 
+def read_text(
+    path,
+    default="",
+):
+
+    try:
+        return (
+            path.read_text()
+            .strip()
+        )
+
+    except OSError:
+        return default
+
 
 def atomic_write(path, content):
     path.parent.mkdir(
@@ -204,7 +218,10 @@ class Worker:
             master_fd
         )
 
-        attrs[3] &= ~termios.ECHO
+        attrs[3] &= ~(
+            termios.ECHO
+            | termios.ECHONL
+        )
 
         termios.tcsetattr(
             master_fd,
@@ -227,10 +244,13 @@ class Worker:
             daemon=True,
         ).start()
 
-        # 初始化 persistent shell
         self.send(
             "source ~/.bashrc "
             ">/dev/null 2>&1 || true; "
+
+            "bind 'set enable-bracketed-paste off' "
+            ">/dev/null 2>&1 || true; "
+
             "export PS1=''; "
             "export PS2=''; "
             "export PYTHONUNBUFFERED=1; "
@@ -272,6 +292,92 @@ class Worker:
             raise RuntimeError(
                 "bash initialization timeout"
             )
+            
+            
+    def append_stream(
+        self,
+        data,
+    ):
+
+        if isinstance(
+            data,
+            str,
+        ):
+            data = data.encode(
+                "utf-8"
+            )
+
+        if not data:
+            return
+
+        # 必须和 output_loop / trim_stream
+        # 使用同一个 lock，避免字节交叉。
+        with self.stream_lock:
+
+            fd = os.open(
+                self.stream,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_APPEND,
+                0o600,
+            )
+
+            try:
+
+                os.write(
+                    fd,
+                    data,
+                )
+
+            finally:
+
+                os.close(fd)
+                
+                    
+    def command_prompt(self):
+
+        pwd = read_text(
+            self.state / "pwd",
+            "?",
+        )
+
+        conda = read_text(
+            self.state / "conda",
+            "",
+        )
+
+        name = read_text(
+            self.root
+            / "meta"
+            / "name",
+            "",
+        )
+
+        label = (
+            name
+            if name
+            else self.sid[:6]
+        )
+
+        env = (
+            f"({conda}) "
+            if conda
+            else ""
+        )
+
+        display_pwd = (
+            Path(pwd).name
+            if pwd != "/"
+            else "/"
+        )
+
+        return (
+            f"{env}"
+            f"H100[{label}]"
+            f":{display_pwd}$ "
+        )
+    
+    
 
     def output_loop(self):
 
@@ -581,6 +687,16 @@ class Worker:
 
         except FileNotFoundError:
             return
+        
+        try:
+            command = (
+                running.read_text()
+                .rstrip("\n")
+            )
+
+        except OSError:
+
+            command = ""
 
         rc_file = (
             self.done
@@ -610,6 +726,31 @@ class Worker:
             "current_job_offset",
             offset,
         )
+        
+# -------------------------------------------------
+# Persist terminal transcript:
+#
+#     (env) H100[name]:pwd$ command
+#     command output...
+#
+# This goes into stream.log, so it survives
+# detach / attach.
+# -------------------------------------------------
+        if command:
+
+            prompt_text = (
+                self.command_prompt()
+            )
+
+            transcript = (
+                prompt_text
+                + command
+                + "\n"
+            )
+
+            self.append_stream(
+                transcript
+            )
 
         # source 而不是 bash xxx.cmd
         #
