@@ -28,6 +28,13 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
 
+import base64
+
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.mouse_events import (
+    MouseEventType,
+)
+
 DONE_MARKER_RE = re.compile(
     rb"\x1eH100_DONE:"
     rb"([^:\x1f]+):"
@@ -262,11 +269,13 @@ class H100UI:
             multiline=True,
             scrollbar=True,
             focusable=True,
-            focus_on_click=False,
+            focus_on_click=True,
             wrap_lines=False,
             style="class:output",
         )
+        self.pending_output = ""
 
+        self._install_output_mouse_handler()
         # -------------------------------------------------
         # Input pane
         #
@@ -289,6 +298,7 @@ class H100UI:
             ),
             complete_while_typing=False,
             wrap_lines=True,
+            focus_on_click=True,
             style="class:input",
         )
 
@@ -383,6 +393,107 @@ class H100UI:
 
         self._load_initial_output()
 
+    def _install_output_mouse_handler(self):
+
+        original_handler = (
+            self.output_area
+            .control
+            .mouse_handler
+        )
+
+        def handler(mouse_event):
+
+            app = get_app()
+
+            # 第一次按下鼠标时就把 focus
+            # 切到 output pane。
+            if (
+                mouse_event.event_type
+                == MouseEventType.MOUSE_DOWN
+            ):
+
+                app.layout.focus(
+                    self.output_area
+                )
+
+            # 如果已经有 selection，
+            # 滚轮不再只是滚 viewport，
+            # 而是继续扩展选区。
+            if (
+                self.output_area.buffer.selection_state
+                is not None
+            ):
+
+                if (
+                    mouse_event.event_type
+                    == MouseEventType.SCROLL_UP
+                ):
+
+                    self._extend_selection_lines(
+                        -3
+                    )
+
+                    app.invalidate()
+
+                    return None
+
+                if (
+                    mouse_event.event_type
+                    == MouseEventType.SCROLL_DOWN
+                ):
+
+                    self._extend_selection_lines(
+                        3
+                    )
+
+                    app.invalidate()
+
+                    return None
+
+            result = original_handler(
+                mouse_event
+            )
+
+            if (
+                self.output_area.buffer.selection_state
+                is not None
+            ):
+
+                self.follow_output = False
+
+            return result
+
+        self.output_area.control.mouse_handler = (
+            handler
+        )
+
+
+    def _extend_selection_lines(
+        self,
+        delta,
+    ):
+
+        buffer = (
+            self.output_area.buffer
+        )
+
+        if buffer.selection_state is None:
+            return
+
+        if delta < 0:
+
+            buffer.cursor_up(
+                count=-delta
+            )
+
+        elif delta > 0:
+
+            buffer.cursor_down(
+                count=delta
+            )
+
+        self.follow_output = False
+
     # =====================================================
     # Status
     # =====================================================
@@ -418,6 +529,7 @@ class H100UI:
             f" | {follow}"
             f" | Ctrl-D detach"
             f" | Ctrl-C interrupt"
+            f" | Alt-C copy"
             f" | Alt-G bottom"
             f"{extra} "
         )
@@ -843,6 +955,34 @@ class H100UI:
             visible
         )
 
+        if (
+            self.output_area.buffer.selection_state
+            is not None
+        ):
+
+            # 正在复制时先暂停 UI append。
+            # H100 任务和 stream.log 仍然继续。
+            self.pending_output += text
+
+            self.follow_output = False
+
+        else:
+
+            self._append_output(
+                text
+            )
+            
+    def _flush_pending_output(self):
+
+        if not self.pending_output:
+            return
+
+        text = self.pending_output
+
+        self.pending_output = ""
+
+        self.follow_output = False
+
         self._append_output(
             text
         )
@@ -871,6 +1011,74 @@ class H100UI:
             self.current_job = (
                 remote_job
             )
+            
+    def _copy_output_selection(
+        self,
+        event,
+    ):
+
+        buffer = (
+            self.output_area.buffer
+        )
+
+        if buffer.selection_state is None:
+
+            self.status_message = (
+                "no selection"
+            )
+
+            event.app.invalidate()
+
+            return
+
+        clipboard_data = (
+            buffer.copy_selection()
+        )
+
+        text = clipboard_data.text
+
+        if not text:
+
+            self.status_message = (
+                "empty selection"
+            )
+
+            return
+
+        encoded = (
+            base64.b64encode(
+                text.encode(
+                    "utf-8"
+                )
+            )
+            .decode(
+                "ascii"
+            )
+        )
+
+        sequence = (
+            "\x1b]52;c;"
+            + encoded
+            + "\x07"
+        )
+
+        event.app.output.write_raw(
+            sequence
+        )
+
+        event.app.output.flush()
+
+        self.status_message = (
+            f"copied {len(text)} chars"
+        )
+
+        self._flush_pending_output()
+
+        event.app.layout.focus(
+            self.input_area
+        )
+
+        event.app.invalidate()
 
     def _before_render(
         self,
@@ -1129,6 +1337,17 @@ class H100UI:
             )
 
             event.app.invalidate()
+            
+        @self.kb.add(
+            "escape",
+            "c",
+            eager=True,
+        )
+        def _copy(event):
+
+            self._copy_output_selection(
+                event
+            )
 
         @self.kb.add("pageup")
         def _page_up(event):
